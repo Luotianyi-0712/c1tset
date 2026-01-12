@@ -4,6 +4,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <unordered_map>
 #include "MinHook.h"
 
 static std::string g_dumpRoot;
@@ -11,10 +12,17 @@ static std::string g_dumpDir;
 
 static CRITICAL_SECTION g_logLock;
 static CRITICAL_SECTION g_dumpLock;
-static volatile LONG g_dumpedAssembly = 0;
-static void* g_activeKey = nullptr;
-static bool g_confirmed = false;
 static volatile LONG g_callCount = 0;
+static bool g_foundAssembly = false;
+
+struct StreamState {
+    std::string path;
+    long long last_offset;
+    bool confirmed;
+};
+
+static std::unordered_map<void*, StreamState> g_streams;
+static unsigned int g_streamIndex = 0;
 
 static std::string GetModuleDir(HMODULE module) {
     char path[MAX_PATH] = {};
@@ -92,23 +100,6 @@ static size_t ClampReadable(const void* ptr, size_t len) {
     return total;
 }
 
-static bool WriteFileBytes(const std::string& path, const void* data, size_t size) {
-    if (!data || size == 0) {
-        return false;
-    }
-    if (size > MAXDWORD) {
-        size = MAXDWORD;
-    }
-    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        return false;
-    }
-    DWORD written = 0;
-    const BOOL ok = WriteFile(hFile, data, static_cast<DWORD>(size), &written, nullptr);
-    CloseHandle(hFile);
-    return ok && written == static_cast<DWORD>(size);
-}
-
 static void DumpChunkAtOffset(const std::string& path, long long offset, const void* data, size_t size) {
     if (!data || size == 0) {
         return;
@@ -138,25 +129,31 @@ static std::string GetDumpPath() {
     return dir + "Assembly-CSharp.dll";
 }
 
-static void StartDump(void* streamKey, long long offset, size_t size, const char* reason) {
-    if (InterlockedCompareExchange(&g_dumpedAssembly, 1, 0) != 0) {
-        return;
-    }
-    const std::string path = GetDumpPath();
-    DeleteFileA(path.c_str());
-    g_activeKey = streamKey;
-    std::ostringstream oss;
-    oss << "Start dump Assembly-CSharp.dll offset=" << offset << " size=" << size << " reason=" << reason;
-    Log(oss.str());
+static std::string MakeTempPath(unsigned int index) {
+    const std::string dir = g_dumpDir.empty() ? ".\\" : g_dumpDir;
+    return dir + "Assembly-CSharp.tmp." + std::to_string(index);
 }
 
-static void StopDump(const char* reason) {
+static std::string MakeFinalPath(unsigned int index) {
+    if (!g_foundAssembly) {
+        return GetDumpPath();
+    }
+    const std::string dir = g_dumpDir.empty() ? ".\\" : g_dumpDir;
+    return dir + "Assembly-CSharp_" + std::to_string(index) + ".dll";
+}
+
+static void FinalizeStream(StreamState& state, unsigned int index, const char* reason) {
     std::ostringstream oss;
-    oss << "Stop dump: " << reason;
+    if (state.confirmed) {
+        const std::string finalPath = MakeFinalPath(index);
+        MoveFileExA(state.path.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING);
+        g_foundAssembly = true;
+        oss << "Finalize dump: " << finalPath << " reason=" << reason;
+    } else {
+        DeleteFileA(state.path.c_str());
+        oss << "Discard dump (no signature) reason=" << reason;
+    }
     Log(oss.str());
-    g_activeKey = nullptr;
-    g_confirmed = false;
-    InterlockedExchange(&g_dumpedAssembly, 0);
 }
 
 using FnSub69FE00 = bool(*)(void* a1, long long* a2, long long a3, void* a4, unsigned long long* a5, long long a6);
@@ -192,37 +189,60 @@ static bool __fastcall HookSub69FE00(void* a1, long long* a2, long long a3, void
         }
 
         EnterCriticalSection(&g_dumpLock);
-        if (!g_activeKey && offset == 0) {
-            StartDump(key, offset, static_cast<size_t>(readSize), "offset0");
-        } else if (!g_activeKey) {
-            if (hitName) {
-                StartDump(key, offset, static_cast<size_t>(readSize), "name");
-            } else if (hitBSJB) {
-                StartDump(key, offset, static_cast<size_t>(readSize), "bsjb");
-            } else if (hitMZ) {
-                StartDump(key, offset, static_cast<size_t>(readSize), "mz");
-            }
+        auto it = g_streams.find(key);
+        if (it == g_streams.end()) {
+            StreamState state;
+            state.path = MakeTempPath(++g_streamIndex);
+            state.last_offset = -1;
+            state.confirmed = false;
+            it = g_streams.emplace(key, state).first;
+            std::ostringstream created;
+            created << "Create stream key=" << key << " path=" << it->second.path;
+            Log(created.str());
         }
-        if (g_activeKey == key) {
-            const std::string path = GetDumpPath();
-            DumpChunkAtOffset(path, offset, a4, static_cast<size_t>(readSize));
-            std::ostringstream oss;
-            oss << "Chunk offset=" << offset << " size=" << readSize;
-            Log(oss.str());
 
-            if (!g_confirmed && (hitName || hitBSJB || hitMZ)) {
-                g_confirmed = true;
-                std::ostringstream confirm;
-                confirm << "Confirmed stream by signature (name=" << hitName
-                        << " bsjb=" << hitBSJB << " mz=" << hitMZ << ")";
-                Log(confirm.str());
-            }
+        StreamState& state = it->second;
+        if (state.last_offset >= 0 && offset < state.last_offset) {
+            FinalizeStream(state, g_streamIndex, "offset-reset");
+            state.path = MakeTempPath(++g_streamIndex);
+            state.last_offset = -1;
+            state.confirmed = false;
+            std::ostringstream restarted;
+            restarted << "Restart stream key=" << key << " path=" << state.path;
+            Log(restarted.str());
+        } else if (state.last_offset > 0 && offset == 0) {
+            FinalizeStream(state, g_streamIndex, "offset-zero");
+            state.path = MakeTempPath(++g_streamIndex);
+            state.last_offset = -1;
+            state.confirmed = false;
+            std::ostringstream restarted;
+            restarted << "Restart stream key=" << key << " path=" << state.path;
+            Log(restarted.str());
         }
+
+        DumpChunkAtOffset(state.path, offset, a4, static_cast<size_t>(readSize));
+        state.last_offset = offset;
+
+        if (!state.confirmed && (hitName || hitBSJB || hitMZ)) {
+            state.confirmed = true;
+            std::ostringstream confirm;
+            confirm << "Confirmed stream key=" << key
+                    << " name=" << hitName
+                    << " bsjb=" << hitBSJB
+                    << " mz=" << hitMZ;
+            Log(confirm.str());
+        }
+
+        std::ostringstream chunk;
+        chunk << "Chunk key=" << key << " offset=" << offset << " size=" << readSize;
+        Log(chunk.str());
         LeaveCriticalSection(&g_dumpLock);
     } else if (!ok || (a5 && *a5 == 0)) {
         EnterCriticalSection(&g_dumpLock);
-        if (g_activeKey == a2) {
-            StopDump("eof");
+        auto it = g_streams.find(a2);
+        if (it != g_streams.end()) {
+            FinalizeStream(it->second, g_streamIndex, "eof");
+            g_streams.erase(it);
         }
         LeaveCriticalSection(&g_dumpLock);
     }
@@ -307,10 +327,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(hModule);
         g_dumpRoot = GetModuleDir(hModule);
         g_dumpDir = g_dumpRoot;
-        g_dumpedAssembly = 0;
-        g_activeKey = nullptr;
-        g_confirmed = false;
         g_callCount = 0;
+        g_foundAssembly = false;
+        g_streamIndex = 0;
         InitializeCriticalSection(&g_logLock);
         InitializeCriticalSection(&g_dumpLock);
         EnsureDumpDir();
