@@ -27,7 +27,19 @@ DWORD FindProcess(const wchar_t* processName) {
     return 0;
 }
 
-BOOL InjectDLL(DWORD processId, const char* dllPath) {
+static string GetDirFromPath(const char* path) {
+    if (!path) {
+        return ".\\";
+    }
+    string p(path);
+    size_t pos = p.find_last_of("\\/");
+    if (pos == string::npos) {
+        return ".\\";
+    }
+    return p.substr(0, pos + 1);
+}
+
+BOOL InjectDLL(DWORD processId, const char* dllPath, const char* dllDir) {
     DWORD attrs = GetFileAttributesA(dllPath);
     if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
         cerr << "DLL not found: " << dllPath << endl;
@@ -61,13 +73,47 @@ BOOL InjectDLL(DWORD processId, const char* dllPath) {
     }
 
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
+    LPVOID pSetDllDirectory = reinterpret_cast<LPVOID>(
+        GetProcAddress(hKernel32, "SetDllDirectoryA"));
     LPVOID pLoadLibrary = reinterpret_cast<LPVOID>(
         GetProcAddress(hKernel32, "LoadLibraryA"));
+    if (!pSetDllDirectory) {
+        cerr << "GetProcAddress(SetDllDirectoryA) failed. Error: " << GetLastError() << endl;
+    }
     if (!pLoadLibrary) {
         cerr << "GetProcAddress(LoadLibraryA) failed. Error: " << GetLastError() << endl;
         VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
         CloseHandle(hProcess);
         return FALSE;
+    }
+
+    if (pSetDllDirectory && dllDir && dllDir[0]) {
+        const size_t dirLen = strlen(dllDir) + 1;
+        LPVOID pRemoteDir = VirtualAllocEx(hProcess, NULL, dirLen, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        if (!pRemoteDir) {
+            cerr << "VirtualAllocEx(dir) failed. Error: " << GetLastError() << endl;
+        } else if (!WriteProcessMemory(hProcess, pRemoteDir, dllDir, dirLen, NULL)) {
+            cerr << "WriteProcessMemory(dir) failed. Error: " << GetLastError() << endl;
+            VirtualFreeEx(hProcess, pRemoteDir, 0, MEM_RELEASE);
+            pRemoteDir = nullptr;
+        } else {
+            HANDLE hDirThread = CreateRemoteThread(hProcess, NULL, 0,
+                                                   (LPTHREAD_START_ROUTINE)pSetDllDirectory,
+                                                   pRemoteDir, 0, NULL);
+            if (!hDirThread) {
+                cerr << "CreateRemoteThread(SetDllDirectoryA) failed. Error: " << GetLastError() << endl;
+            } else {
+                WaitForSingleObject(hDirThread, INFINITE);
+                DWORD dirExit = 0;
+                if (!GetExitCodeThread(hDirThread, &dirExit) || dirExit == 0) {
+                    cerr << "SetDllDirectoryA failed in target process." << endl;
+                } else {
+                    cout << "SetDllDirectoryA OK: " << dllDir << endl;
+                }
+                CloseHandle(hDirThread);
+            }
+            VirtualFreeEx(hProcess, pRemoteDir, 0, MEM_RELEASE);
+        }
     }
 
     HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, 
@@ -126,7 +172,10 @@ int main(int argc, char* argv[]) {
     cout << "DLL Path: " << dllPath << endl;
     cout << "Injecting..." << endl;
 
-    if (InjectDLL(pid, dllPath)) {
+    const string dllDir = GetDirFromPath(dllPath);
+    cout << "DLL Dir: " << dllDir << endl;
+
+    if (InjectDLL(pid, dllPath, dllDir.c_str())) {
         cout << "Injection successful!" << endl;
         cout << "DLLs will be dumped to current directory." << endl;
     } else {
