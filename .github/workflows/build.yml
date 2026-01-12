@@ -1,0 +1,53 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
+            git
+
+      - name: Fetch MinHook
+        shell: msys2 {0}
+        run: |
+          if [ ! -d minhook ]; then
+            git clone --depth 1 --branch v1.3.3 https://github.com/TsudaKageyu/minhook.git minhook
+          fi
+
+      - name: Build MinHook
+        shell: msys2 {0}
+        run: |
+          cmake -S minhook -B minhook/build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
+          cmake --build minhook/build --config Release
+          mkdir -p minhook/lib
+          lib_path=$(find minhook/build -name "libMinHook.a" | head -n 1)
+          if [ -z "$lib_path" ]; then
+            echo "MinHook lib not found"
+            exit 1
+          fi
+          cp "$lib_path" minhook/lib/libminhook.x64.a
+
+      - name: Build
+        shell: msys2 {0}
+        run: make
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            DumpDll.dll
+            DumpDecrypt.dll
+            Injector.exe
