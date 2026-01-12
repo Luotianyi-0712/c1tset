@@ -10,7 +10,9 @@ static std::string g_dumpRoot;
 static std::string g_dumpDir;
 
 static CRITICAL_SECTION g_logLock;
+static CRITICAL_SECTION g_dumpLock;
 static volatile LONG g_dumpedAssembly = 0;
+static void* g_activeStream = nullptr;
 
 static std::string GetModuleDir(HMODULE module) {
     char path[MAX_PATH] = {};
@@ -105,29 +107,51 @@ static bool WriteFileBytes(const std::string& path, const void* data, size_t siz
     return ok && written == static_cast<DWORD>(size);
 }
 
-static void DumpAssemblyOnce(const char* tag, const unsigned char* data, size_t size) {
+static void DumpChunkAtOffset(const std::string& path, long long offset, const void* data, size_t size) {
     if (!data || size == 0) {
         return;
     }
-    const size_t scan = std::min<size_t>(size, 2 * 1024 * 1024);
-    if (!ContainsAscii(data, scan, "Assembly-CSharp")) {
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        Log("Open dump file failed: " + path);
         return;
     }
+    LARGE_INTEGER li;
+    li.QuadPart = offset;
+    if (offset >= 0) {
+        SetFilePointerEx(hFile, li, nullptr, FILE_BEGIN);
+    } else {
+        SetFilePointerEx(hFile, li, nullptr, FILE_END);
+    }
+    DWORD written = 0;
+    const BOOL ok = WriteFile(hFile, data, static_cast<DWORD>(size), &written, nullptr);
+    CloseHandle(hFile);
+    if (!ok || written != static_cast<DWORD>(size)) {
+        Log("Write dump chunk failed");
+    }
+}
+
+static std::string GetDumpPath() {
+    const std::string dir = g_dumpDir.empty() ? ".\\" : g_dumpDir;
+    return dir + "Assembly-CSharp.dll";
+}
+
+static void StartDump(void* streamKey, long long offset, size_t size) {
     if (InterlockedCompareExchange(&g_dumpedAssembly, 1, 0) != 0) {
         return;
     }
-    const std::string dir = g_dumpDir.empty() ? ".\\" : g_dumpDir;
-    std::string path = dir + "Assembly-CSharp.dll";
-    if (WriteFileBytes(path, data, size)) {
-        std::ostringstream oss;
-        oss << "Dumped Assembly-CSharp.dll from " << tag << " (" << size << " bytes)";
-        Log(oss.str());
-    } else {
-        InterlockedExchange(&g_dumpedAssembly, 0);
-        std::ostringstream oss;
-        oss << "Dump failed from " << tag << " (" << size << " bytes)";
-        Log(oss.str());
-    }
+    const std::string path = GetDumpPath();
+    DeleteFileA(path.c_str());
+    g_activeStream = streamKey;
+    std::ostringstream oss;
+    oss << "Start dump Assembly-CSharp.dll offset=" << offset << " size=" << size;
+    Log(oss.str());
+}
+
+static void StopDump(const char* reason) {
+    std::ostringstream oss;
+    oss << "Stop dump: " << reason;
+    Log(oss.str());
 }
 
 using FnSub69FE00 = bool(*)(void* a1, long long* a2, long long a3, void* a4, unsigned long long* a5, long long a6);
@@ -138,8 +162,31 @@ static FnSub6A2590 g_origSub6A2590 = nullptr;
 
 static bool __fastcall HookSub69FE00(void* a1, long long* a2, long long a3, void* a4, unsigned long long* a5, long long a6) {
     const bool ok = g_origSub69FE00(a1, a2, a3, a4, a5, a6);
-    if (ok && a4 && a5 && *a5 > 0) {
-        DumpAssemblyOnce("sub_18069FE00", static_cast<const unsigned char*>(a4), static_cast<size_t>(*a5));
+    const unsigned long long readSize = (a5 ? *a5 : 0);
+    if (ok && a4 && readSize > 0) {
+        const size_t scan = std::min<size_t>(static_cast<size_t>(readSize), 2 * 1024 * 1024);
+        const bool hit = ContainsAscii(static_cast<const unsigned char*>(a4), scan, "Assembly-CSharp");
+        const long long offset = (a2 ? *a2 : -1);
+
+        EnterCriticalSection(&g_dumpLock);
+        if (!g_activeStream && hit && offset == 0) {
+            StartDump(a1, offset, static_cast<size_t>(readSize));
+        }
+        if (g_activeStream == a1) {
+            const std::string path = GetDumpPath();
+            DumpChunkAtOffset(path, offset, a4, static_cast<size_t>(readSize));
+            std::ostringstream oss;
+            oss << "Chunk offset=" << offset << " size=" << readSize;
+            Log(oss.str());
+        }
+        LeaveCriticalSection(&g_dumpLock);
+    } else if (!ok || (a5 && *a5 == 0)) {
+        EnterCriticalSection(&g_dumpLock);
+        if (g_activeStream == a1) {
+            g_activeStream = nullptr;
+            StopDump("eof");
+        }
+        LeaveCriticalSection(&g_dumpLock);
     }
     return ok;
 }
@@ -151,7 +198,12 @@ static long long __fastcall HookSub6A2590(void* a1, unsigned int* a2, size_t n, 
             reinterpret_cast<const unsigned char*>(a2) + 8);
         const size_t readable = ClampReadable(buf, static_cast<size_t>(*out_read));
         if (readable > 0) {
-            DumpAssemblyOnce("sub_1806A2590", buf, readable);
+            const size_t scan = std::min<size_t>(readable, 2 * 1024 * 1024);
+            if (ContainsAscii(buf, scan, "Assembly-CSharp")) {
+                std::ostringstream oss;
+                oss << "Hit Assembly-CSharp in sub_1806A2590 size=" << readable;
+                Log(oss.str());
+            }
         }
     }
     return ret;
@@ -218,6 +270,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         g_dumpRoot = GetModuleDir(hModule);
         g_dumpDir = g_dumpRoot;
         InitializeCriticalSection(&g_logLock);
+        InitializeCriticalSection(&g_dumpLock);
         EnsureDumpDir();
         if (MH_Initialize() != MH_OK) {
             Log("MH_Initialize failed");
@@ -230,6 +283,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     } else if (reason == DLL_PROCESS_DETACH) {
         MH_Uninitialize();
         DeleteCriticalSection(&g_logLock);
+        DeleteCriticalSection(&g_dumpLock);
     }
     return TRUE;
 }
