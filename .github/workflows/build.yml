@@ -23,7 +23,8 @@ jobs:
       - name: Fetch MinHook
         shell: msys2 {0}
         run: |
-          if [ ! -d minhook ]; then
+          if [ ! -f minhook/CMakeLists.txt ]; then
+            rm -rf minhook
             git clone --depth 1 --branch v1.3.3 https://github.com/TsudaKageyu/minhook.git minhook
           fi
 
