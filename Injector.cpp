@@ -28,6 +28,17 @@ DWORD FindProcess(const wchar_t* processName) {
 }
 
 BOOL InjectDLL(DWORD processId, const char* dllPath) {
+    DWORD attrs = GetFileAttributesA(dllPath);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        cerr << "DLL not found: " << dllPath << endl;
+        return FALSE;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+    if (GetFileAttributesExA(dllPath, GetFileExInfoStandard, &fad)) {
+        ULONGLONG size = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+        cout << "DLL size: " << size << " bytes" << endl;
+    }
+
     HANDLE hProcess = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
     if (!hProcess) {
         cerr << "Failed to open process. Error: " << GetLastError() << endl;
@@ -52,6 +63,12 @@ BOOL InjectDLL(DWORD processId, const char* dllPath) {
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
     LPVOID pLoadLibrary = reinterpret_cast<LPVOID>(
         GetProcAddress(hKernel32, "LoadLibraryA"));
+    if (!pLoadLibrary) {
+        cerr << "GetProcAddress(LoadLibraryA) failed. Error: " << GetLastError() << endl;
+        VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
+        CloseHandle(hProcess);
+        return FALSE;
+    }
 
     HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, 
                                        (LPTHREAD_START_ROUTINE)pLoadLibrary, 
@@ -64,6 +81,15 @@ BOOL InjectDLL(DWORD processId, const char* dllPath) {
     }
 
     WaitForSingleObject(hThread, INFINITE);
+
+    DWORD exitCode = 0;
+    if (!GetExitCodeThread(hThread, &exitCode) || exitCode == 0) {
+        cerr << "LoadLibraryA failed in target process." << endl;
+        VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
+        CloseHandle(hThread);
+        CloseHandle(hProcess);
+        return FALSE;
+    }
     
     VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
     CloseHandle(hThread);
@@ -89,16 +115,20 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // 获取 DLL 完整路径
+    // 获取 DLL 完整路径（支持传参指定）
+    const char* inputPath = "DumpDll.dll";
+    if (argc > 1 && argv[1] && argv[1][0]) {
+        inputPath = argv[1];
+    }
     char dllPath[MAX_PATH];
-    GetFullPathNameA("DumpDll.dll", MAX_PATH, dllPath, NULL);
+    GetFullPathNameA(inputPath, MAX_PATH, dllPath, NULL);
     
     cout << "DLL Path: " << dllPath << endl;
     cout << "Injecting..." << endl;
 
     if (InjectDLL(pid, dllPath)) {
         cout << "Injection successful!" << endl;
-        cout << "DLLs will be dumped to D:\\browndust2_dump\\" << endl;
+        cout << "DLLs will be dumped to current directory." << endl;
     } else {
         cout << "Injection failed!" << endl;
     }
@@ -106,4 +136,3 @@ int main(int argc, char* argv[]) {
     system("pause");
     return 0;
 }
-
