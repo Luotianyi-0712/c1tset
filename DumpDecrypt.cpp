@@ -12,7 +12,7 @@ static std::string g_dumpDir;
 static CRITICAL_SECTION g_logLock;
 static CRITICAL_SECTION g_dumpLock;
 static volatile LONG g_dumpedAssembly = 0;
-static void* g_activeStream = nullptr;
+static void* g_activeKey = nullptr;
 static volatile LONG g_callCount = 0;
 
 static std::string GetModuleDir(HMODULE module) {
@@ -143,7 +143,7 @@ static void StartDump(void* streamKey, long long offset, size_t size, const char
     }
     const std::string path = GetDumpPath();
     DeleteFileA(path.c_str());
-    g_activeStream = streamKey;
+    g_activeKey = streamKey;
     std::ostringstream oss;
     oss << "Start dump Assembly-CSharp.dll offset=" << offset << " size=" << size << " reason=" << reason;
     Log(oss.str());
@@ -171,11 +171,14 @@ static bool __fastcall HookSub69FE00(void* a1, long long* a2, long long a3, void
         const bool hitBSJB = ContainsAscii(buf, scan, "BSJB");
         const bool hitMZ = (readSize >= 2 && buf[0] == 'M' && buf[1] == 'Z');
         const long long offset = (a2 ? *a2 : -1);
+        void* key = reinterpret_cast<void*>(a2);
 
         const LONG callIndex = InterlockedIncrement(&g_callCount);
         if (callIndex <= 50) {
             std::ostringstream oss;
             oss << "sub_18069FE00 call#" << callIndex
+                << " key=" << key
+                << " a1=" << a1
                 << " offset=" << offset
                 << " size=" << readSize
                 << " hitName=" << hitName
@@ -185,16 +188,16 @@ static bool __fastcall HookSub69FE00(void* a1, long long* a2, long long a3, void
         }
 
         EnterCriticalSection(&g_dumpLock);
-        if (!g_activeStream) {
+        if (!g_activeKey) {
             if (hitName) {
-                StartDump(a1, offset, static_cast<size_t>(readSize), "name");
+                StartDump(key, offset, static_cast<size_t>(readSize), "name");
             } else if (hitBSJB) {
-                StartDump(a1, offset, static_cast<size_t>(readSize), "bsjb");
+                StartDump(key, offset, static_cast<size_t>(readSize), "bsjb");
             } else if (hitMZ) {
-                StartDump(a1, offset, static_cast<size_t>(readSize), "mz");
+                StartDump(key, offset, static_cast<size_t>(readSize), "mz");
             }
         }
-        if (g_activeStream == a1) {
+        if (g_activeKey == key) {
             const std::string path = GetDumpPath();
             DumpChunkAtOffset(path, offset, a4, static_cast<size_t>(readSize));
             std::ostringstream oss;
@@ -204,8 +207,8 @@ static bool __fastcall HookSub69FE00(void* a1, long long* a2, long long a3, void
         LeaveCriticalSection(&g_dumpLock);
     } else if (!ok || (a5 && *a5 == 0)) {
         EnterCriticalSection(&g_dumpLock);
-        if (g_activeStream == a1) {
-            g_activeStream = nullptr;
+        if (g_activeKey == a2) {
+            g_activeKey = nullptr;
             StopDump("eof");
         }
         LeaveCriticalSection(&g_dumpLock);
@@ -292,7 +295,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         g_dumpRoot = GetModuleDir(hModule);
         g_dumpDir = g_dumpRoot;
         g_dumpedAssembly = 0;
-        g_activeStream = nullptr;
+        g_activeKey = nullptr;
         g_callCount = 0;
         InitializeCriticalSection(&g_logLock);
         InitializeCriticalSection(&g_dumpLock);
