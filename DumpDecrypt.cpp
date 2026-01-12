@@ -4,67 +4,60 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
-#include <unordered_map>
+#include <map>
 #include "MinHook.h"
 
-static std::string g_dumpRoot;
 static std::string g_dumpDir;
-
 static CRITICAL_SECTION g_logLock;
 static CRITICAL_SECTION g_dumpLock;
 static volatile LONG g_callCount = 0;
-static bool g_foundAssembly = false;
 
-struct StreamState {
+// 用a1作为流标识
+struct StreamInfo {
+    unsigned int id;
     std::string path;
+    HANDLE hFile;
+    long long first_offset;
     long long last_offset;
-    bool confirmed;
+    long long min_offset;
+    long long max_offset;
+    size_t total_bytes;
+    size_t chunk_count;
+    bool has_mz;
+    bool has_bsjb;
+    bool has_name;
 };
 
-static std::unordered_map<void*, StreamState> g_streams;
+static std::map<void*, StreamInfo> g_streams;  // key = a1
 static unsigned int g_streamIndex = 0;
 
 static std::string GetModuleDir(HMODULE module) {
     char path[MAX_PATH] = {};
-    const DWORD len = GetModuleFileNameA(module, path, MAX_PATH);
-    if (len == 0 || len >= MAX_PATH) {
-        return ".\\";
-    }
+    DWORD len = GetModuleFileNameA(module, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return ".\\";
     std::string full(path);
-    const size_t pos = full.find_last_of("\\/");
-    if (pos == std::string::npos) {
-        return ".\\";
-    }
-    return full.substr(0, pos + 1);
+    size_t pos = full.find_last_of("\\/");
+    return (pos == std::string::npos) ? ".\\" : full.substr(0, pos + 1);
 }
 
 static void Log(const std::string& msg) {
     EnterCriticalSection(&g_logLock);
-    const std::string dir = g_dumpDir.empty() ? ".\\" : g_dumpDir;
-    std::ofstream logFile(dir + "decrypt_log.txt", std::ios::app);
-    if (!logFile.is_open()) {
-        OutputDebugStringA(("Log open failed: " + dir + "decrypt_log.txt\n").c_str());
-        LeaveCriticalSection(&g_logLock);
-        return;
+    std::ofstream logFile(g_dumpDir + "decrypt_log.txt", std::ios::app);
+    if (logFile.is_open()) {
+        logFile << msg << std::endl;
     }
-    logFile << msg << std::endl;
     LeaveCriticalSection(&g_logLock);
 }
 
 static void EnsureDumpDir() {
-    if (!g_dumpRoot.empty()) {
-        CreateDirectoryA(g_dumpRoot.c_str(), nullptr);
-    }
     if (!g_dumpDir.empty()) {
         CreateDirectoryA(g_dumpDir.c_str(), nullptr);
     }
 }
 
 static bool ContainsAscii(const unsigned char* data, size_t size, const char* needle) {
-    const size_t needle_len = std::strlen(needle);
-    if (!data || size < needle_len) {
-        return false;
-    }
+    size_t needle_len = std::strlen(needle);
+    if (!data || size < needle_len) return false;
     for (size_t i = 0; i + needle_len <= size; ++i) {
         if (std::memcmp(data + i, needle, needle_len) == 0) {
             return true;
@@ -73,275 +66,274 @@ static bool ContainsAscii(const unsigned char* data, size_t size, const char* ne
     return false;
 }
 
-static size_t ClampReadable(const void* ptr, size_t len) {
-    if (!ptr || len == 0) {
-        return 0;
-    }
-    const unsigned char* cur = static_cast<const unsigned char*>(ptr);
-    size_t total = 0;
-    while (total < len) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery(cur, &mbi, sizeof(mbi))) {
-            break;
-        }
-        if (mbi.State != MEM_COMMIT) {
-            break;
-        }
-        if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) {
-            break;
-        }
-        const unsigned char* region_end =
-            static_cast<const unsigned char*>(mbi.BaseAddress) + mbi.RegionSize;
-        const size_t region_bytes = static_cast<size_t>(region_end - cur);
-        const size_t step = std::min(region_bytes, len - total);
-        total += step;
-        cur += step;
-    }
-    return total;
-}
-
-static void DumpChunkAtOffset(const std::string& path, long long offset, const void* data, size_t size) {
-    if (!data || size == 0) {
-        return;
-    }
-    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (hFile == INVALID_HANDLE_VALUE) {
-        Log("Open dump file failed: " + path);
-        return;
-    }
-    LARGE_INTEGER li;
-    li.QuadPart = offset;
-    if (offset >= 0) {
-        SetFilePointerEx(hFile, li, nullptr, FILE_BEGIN);
-    } else {
-        SetFilePointerEx(hFile, li, nullptr, FILE_END);
-    }
-    DWORD written = 0;
-    const BOOL ok = WriteFile(hFile, data, static_cast<DWORD>(size), &written, nullptr);
-    CloseHandle(hFile);
-    if (!ok || written != static_cast<DWORD>(size)) {
-        Log("Write dump chunk failed");
-    }
-}
-
-static std::string GetDumpPath() {
-    const std::string dir = g_dumpDir.empty() ? ".\\" : g_dumpDir;
-    return dir + "Assembly-CSharp.dll";
-}
-
-static std::string MakeTempPath(unsigned int index) {
-    const std::string dir = g_dumpDir.empty() ? ".\\" : g_dumpDir;
-    return dir + "Assembly-CSharp.tmp." + std::to_string(index);
-}
-
-static std::string MakeFinalPath(unsigned int index) {
-    if (!g_foundAssembly) {
-        return GetDumpPath();
-    }
-    const std::string dir = g_dumpDir.empty() ? ".\\" : g_dumpDir;
-    return dir + "Assembly-CSharp_" + std::to_string(index) + ".dll";
-}
-
-static void FinalizeStream(StreamState& state, unsigned int index, const char* reason) {
-    std::ostringstream oss;
-    if (state.confirmed) {
-        const std::string finalPath = MakeFinalPath(index);
-        MoveFileExA(state.path.c_str(), finalPath.c_str(), MOVEFILE_REPLACE_EXISTING);
-        g_foundAssembly = true;
-        oss << "Finalize dump: " << finalPath << " reason=" << reason;
-    } else {
-        DeleteFileA(state.path.c_str());
-        oss << "Discard dump (no signature) reason=" << reason;
-    }
-    Log(oss.str());
+static bool IsMZHeader(const unsigned char* data, size_t size) {
+    return size >= 64 && data[0] == 'M' && data[1] == 'Z';
 }
 
 using FnSub69FE00 = bool(*)(void* a1, long long* a2, long long a3, void* a4, unsigned long long* a5, long long a6);
-using FnSub6A2590 = long long(*)(void* a1, unsigned int* a2, size_t n, unsigned long long* out_read);
-
 static FnSub69FE00 g_origSub69FE00 = nullptr;
-static FnSub6A2590 g_origSub6A2590 = nullptr;
 
 static bool __fastcall HookSub69FE00(void* a1, long long* a2, long long a3, void* a4, unsigned long long* a5, long long a6) {
     const bool ok = g_origSub69FE00(a1, a2, a3, a4, a5, a6);
     const unsigned long long readSize = (a5 ? *a5 : 0);
-    if (ok && a4 && readSize > 0) {
-        const size_t scan = std::min<size_t>(static_cast<size_t>(readSize), 2 * 1024 * 1024);
-        const unsigned char* buf = static_cast<const unsigned char*>(a4);
-        const bool hitName = ContainsAscii(buf, scan, "Assembly-CSharp");
-        const bool hitBSJB = ContainsAscii(buf, scan, "BSJB");
-        const bool hitMZ = (readSize >= 2 && buf[0] == 'M' && buf[1] == 'Z');
-        const long long offset = (a2 ? *a2 : -1);
-        void* key = reinterpret_cast<void*>(a2);
-
-        const LONG callIndex = InterlockedIncrement(&g_callCount);
-        if (callIndex <= 50) {
-            std::ostringstream oss;
-            oss << "sub_18069FE00 call#" << callIndex
-                << " key=" << key
-                << " a1=" << a1
-                << " offset=" << offset
-                << " size=" << readSize
-                << " hitName=" << hitName
-                << " hitBSJB=" << hitBSJB
-                << " hitMZ=" << hitMZ;
-            Log(oss.str());
-        }
-
-        EnterCriticalSection(&g_dumpLock);
-        auto it = g_streams.find(key);
-        if (it == g_streams.end()) {
-            StreamState state;
-            state.path = MakeTempPath(++g_streamIndex);
-            state.last_offset = -1;
-            state.confirmed = false;
-            it = g_streams.emplace(key, state).first;
-            std::ostringstream created;
-            created << "Create stream key=" << key << " path=" << it->second.path;
-            Log(created.str());
-        }
-
-        StreamState& state = it->second;
-        if (state.last_offset >= 0 && offset < state.last_offset) {
-            FinalizeStream(state, g_streamIndex, "offset-reset");
-            state.path = MakeTempPath(++g_streamIndex);
-            state.last_offset = -1;
-            state.confirmed = false;
-            std::ostringstream restarted;
-            restarted << "Restart stream key=" << key << " path=" << state.path;
-            Log(restarted.str());
-        } else if (state.last_offset > 0 && offset == 0) {
-            FinalizeStream(state, g_streamIndex, "offset-zero");
-            state.path = MakeTempPath(++g_streamIndex);
-            state.last_offset = -1;
-            state.confirmed = false;
-            std::ostringstream restarted;
-            restarted << "Restart stream key=" << key << " path=" << state.path;
-            Log(restarted.str());
-        }
-
-        DumpChunkAtOffset(state.path, offset, a4, static_cast<size_t>(readSize));
-        state.last_offset = offset;
-
-        if (!state.confirmed && (hitName || hitBSJB || hitMZ)) {
-            state.confirmed = true;
-            std::ostringstream confirm;
-            confirm << "Confirmed stream key=" << key
-                    << " name=" << hitName
-                    << " bsjb=" << hitBSJB
-                    << " mz=" << hitMZ;
-            Log(confirm.str());
-        }
-
-        std::ostringstream chunk;
-        chunk << "Chunk key=" << key << " offset=" << offset << " size=" << readSize;
-        Log(chunk.str());
-        LeaveCriticalSection(&g_dumpLock);
-    } else if (!ok || (a5 && *a5 == 0)) {
-        EnterCriticalSection(&g_dumpLock);
-        auto it = g_streams.find(a2);
-        if (it != g_streams.end()) {
-            FinalizeStream(it->second, g_streamIndex, "eof");
-            g_streams.erase(it);
-        }
-        LeaveCriticalSection(&g_dumpLock);
+    
+    if (!ok || !a4 || readSize == 0) {
+        return ok;
     }
+    
+    const unsigned char* buf = static_cast<const unsigned char*>(a4);
+    const size_t size = static_cast<size_t>(readSize);
+    const long long offset = (a2 ? *a2 : -1);
+    
+    if (offset < 0) return ok;
+    
+    // 用a1作为流标识！
+    void* streamKey = a1;
+    
+    const bool hitName = ContainsAscii(buf, size, "Assembly-CSharp");
+    const bool hitBSJB = ContainsAscii(buf, size, "BSJB");
+    const bool hitMZ = IsMZHeader(buf, size);
+    
+    const LONG callIndex = InterlockedIncrement(&g_callCount);
+    
+    EnterCriticalSection(&g_dumpLock);
+    
+    // 查找或创建流
+    auto it = g_streams.find(streamKey);
+    if (it == g_streams.end()) {
+        StreamInfo info = {};
+        info.id = ++g_streamIndex;
+        info.path = g_dumpDir + "stream_" + std::to_string(info.id) + ".bin";
+        info.hFile = CreateFileA(info.path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                                 nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        info.first_offset = offset;
+        info.last_offset = -1;
+        info.min_offset = offset;
+        info.max_offset = offset;
+        info.total_bytes = 0;
+        info.chunk_count = 0;
+        info.has_mz = false;
+        info.has_bsjb = false;
+        info.has_name = false;
+        
+        it = g_streams.emplace(streamKey, info).first;
+        
+        std::ostringstream oss;
+        oss << "NEW STREAM #" << info.id << " a1=" << streamKey << " first_offset=" << offset;
+        Log(oss.str());
+    }
+    
+    StreamInfo& stream = it->second;
+    
+    // 更新签名
+    if (hitMZ) stream.has_mz = true;
+    if (hitBSJB) stream.has_bsjb = true;
+    if (hitName) stream.has_name = true;
+    
+    // 更新offset范围
+    if (offset < stream.min_offset) stream.min_offset = offset;
+    if (offset > stream.max_offset) stream.max_offset = offset;
+    
+    // 写入文件（使用相对于min_offset的位置）
+    if (stream.hFile != INVALID_HANDLE_VALUE) {
+        long long write_offset = offset - stream.min_offset;
+        
+        LARGE_INTEGER li;
+        li.QuadPart = write_offset;
+        SetFilePointerEx(stream.hFile, li, nullptr, FILE_BEGIN);
+        
+        DWORD written = 0;
+        WriteFile(stream.hFile, buf, static_cast<DWORD>(size), &written, nullptr);
+        
+        stream.total_bytes += written;
+        stream.chunk_count++;
+    }
+    
+    stream.last_offset = offset;
+    
+    // 日志
+    if (callIndex <= 50 || hitName || hitBSJB || hitMZ || 
+        (stream.has_name && stream.chunk_count % 1000 == 0)) {
+        std::ostringstream oss;
+        oss << "#" << callIndex
+            << " stream#" << stream.id
+            << " off=" << offset
+            << " sz=" << size
+            << " chunks=" << stream.chunk_count
+            << " total=" << stream.total_bytes
+            << " range=[" << stream.min_offset << "," << stream.max_offset << "]";
+        if (hitMZ) oss << " [MZ]";
+        if (hitBSJB) oss << " [BSJB]";
+        if (hitName) oss << " [NAME]";
+        Log(oss.str());
+    }
+    
+    LeaveCriticalSection(&g_dumpLock);
+    
     return ok;
 }
 
-static long long __fastcall HookSub6A2590(void* a1, unsigned int* a2, size_t n, unsigned long long* out_read) {
-    const long long ret = g_origSub6A2590(a1, a2, n, out_read);
-    if (out_read && *out_read > 0 && a2) {
-        const unsigned char* buf = *reinterpret_cast<const unsigned char* const*>(
-            reinterpret_cast<const unsigned char*>(a2) + 8);
-        const size_t readable = ClampReadable(buf, static_cast<size_t>(*out_read));
-        if (readable > 0) {
-            const size_t scan = std::min<size_t>(readable, 2 * 1024 * 1024);
-            if (ContainsAscii(buf, scan, "Assembly-CSharp")) {
-                std::ostringstream oss;
-                oss << "Hit Assembly-CSharp in sub_1806A2590 size=" << readable;
-                Log(oss.str());
-            }
+static void PrintFinalStatus() {
+    Log("\n=== FINAL STREAM STATUS ===");
+    Log("Looking for: ~62.5MB file with Assembly-CSharp + BSJB");
+    Log("");
+    
+    StreamInfo* bestMatch = nullptr;
+    int bestScore = 0;
+    
+    for (auto& kv : g_streams) {
+        StreamInfo& s = kv.second;
+        
+        // 计算文件大小（基于offset范围）
+        long long fileSize = s.max_offset - s.min_offset + 7168;  // 估算
+        
+        // 评分
+        int score = 0;
+        if (s.has_name) score += 100;
+        if (s.has_bsjb) score += 50;
+        if (s.has_mz) score += 10;
+        if (fileSize >= 50000000 && fileSize <= 80000000) score += 200;  // 大小匹配
+        
+        std::ostringstream oss;
+        oss << "Stream #" << s.id
+            << " | score=" << score
+            << " | size~" << (fileSize / 1024 / 1024) << "MB"
+            << " | chunks=" << s.chunk_count
+            << " | MZ=" << s.has_mz
+            << " | BSJB=" << s.has_bsjb
+            << " | NAME=" << s.has_name
+            << " | range=[" << s.min_offset << "," << s.max_offset << "]";
+        Log(oss.str());
+        
+        if (score > bestScore) {
+            bestScore = score;
+            bestMatch = &s;
         }
     }
-    return ret;
+    
+    if (bestMatch && bestScore >= 150) {
+        Log("");
+        Log("*** BEST MATCH: Stream #" + std::to_string(bestMatch->id) + " ***");
+        
+        // 关闭并重命名
+        if (bestMatch->hFile != INVALID_HANDLE_VALUE) {
+            FlushFileBuffers(bestMatch->hFile);
+            CloseHandle(bestMatch->hFile);
+            bestMatch->hFile = INVALID_HANDLE_VALUE;
+        }
+        
+        std::string newName = g_dumpDir + "Assembly-CSharp_DUMPED.dll";
+        DeleteFileA(newName.c_str());
+        if (MoveFileA(bestMatch->path.c_str(), newName.c_str())) {
+            Log("Renamed to: " + newName);
+        }
+    } else {
+        Log("");
+        Log("No confident match found. Check streams manually.");
+    }
 }
 
 static bool InstallHook(void* target, void* detour, void** original, const char* name) {
     if (MH_CreateHook(target, detour, reinterpret_cast<LPVOID*>(original)) != MH_OK) {
-        std::ostringstream oss;
-        oss << "MH_CreateHook failed: " << name;
-        Log(oss.str());
+        Log(std::string("MH_CreateHook failed: ") + name);
         return false;
     }
     if (MH_EnableHook(target) != MH_OK) {
-        std::ostringstream oss;
-        oss << "MH_EnableHook failed: " << name;
-        Log(oss.str());
+        Log(std::string("MH_EnableHook failed: ") + name);
         return false;
     }
-    std::ostringstream oss;
-    oss << "Hooked: " << name;
-    Log(oss.str());
+    Log(std::string("Hooked: ") + name);
     return true;
 }
 
 static DWORD WINAPI HookThread(LPVOID) {
     EnsureDumpDir();
-    Log("DumpDecrypt injected");
-    Log("Log path: " + (g_dumpDir.empty() ? std::string(".\\decrypt_log.txt") : g_dumpDir + "decrypt_log.txt"));
-
+    
+    Log("=== DumpDecrypt v6 - Using a1 as stream key ===");
+    
     HMODULE unity = nullptr;
     for (int i = 0; i < 120; ++i) {
         unity = GetModuleHandleA("UnityPlayer.dll");
-        if (unity) {
-            break;
-        }
+        if (unity) break;
         Sleep(500);
     }
+    
     if (!unity) {
         Log("UnityPlayer.dll not loaded");
         return 0;
     }
-
+    
     const uintptr_t base = reinterpret_cast<uintptr_t>(unity);
+    
+    std::ostringstream oss;
+    oss << "UnityPlayer.dll base = 0x" << std::hex << base;
+    Log(oss.str());
+    
     void* addr69fe00 = reinterpret_cast<void*>(base + 0x69FE00);
-    void* addr6a2590 = reinterpret_cast<void*>(base + 0x6A2590);
-
-    {
-        std::ostringstream oss;
-        oss << "UnityPlayer.dll base = 0x" << std::hex << base;
-        Log(oss.str());
-    }
-
+    
     InstallHook(addr69fe00, reinterpret_cast<void*>(&HookSub69FE00),
                 reinterpret_cast<void**>(&g_origSub69FE00), "sub_18069FE00");
-    InstallHook(addr6a2590, reinterpret_cast<void*>(&HookSub6A2590),
-                reinterpret_cast<void**>(&g_origSub6A2590), "sub_1806A2590");
-
+    
+    // 定期报告
+    while (true) {
+        Sleep(15000);
+        EnterCriticalSection(&g_dumpLock);
+        
+        std::ostringstream status;
+        status << "STATUS: " << g_streams.size() << " streams, " << g_callCount << " calls";
+        Log(status.str());
+        
+        for (auto& kv : g_streams) {
+            StreamInfo& s = kv.second;
+            if (s.has_name || s.has_bsjb || s.total_bytes > 10000000) {
+                std::ostringstream oss;
+                oss << "  #" << s.id << ": " << (s.total_bytes/1024/1024) << "MB"
+                    << " chunks=" << s.chunk_count
+                    << " NAME=" << s.has_name
+                    << " BSJB=" << s.has_bsjb;
+                Log(oss.str());
+            }
+        }
+        
+        LeaveCriticalSection(&g_dumpLock);
+    }
+    
     return 0;
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        g_dumpRoot = GetModuleDir(hModule);
-        g_dumpDir = g_dumpRoot;
+        g_dumpDir = GetModuleDir(hModule);
         g_callCount = 0;
-        g_foundAssembly = false;
         g_streamIndex = 0;
         InitializeCriticalSection(&g_logLock);
         InitializeCriticalSection(&g_dumpLock);
         EnsureDumpDir();
+        
         if (MH_Initialize() != MH_OK) {
             Log("MH_Initialize failed");
             return FALSE;
         }
+        
         HANDLE thread = CreateThread(nullptr, 0, HookThread, nullptr, 0, nullptr);
-        if (thread) {
-            CloseHandle(thread);
-        }
+        if (thread) CloseHandle(thread);
+        
     } else if (reason == DLL_PROCESS_DETACH) {
+        EnterCriticalSection(&g_dumpLock);
+        
+        PrintFinalStatus();
+        
+        // 关闭所有文件
+        for (auto& kv : g_streams) {
+            if (kv.second.hFile != INVALID_HANDLE_VALUE) {
+                FlushFileBuffers(kv.second.hFile);
+                CloseHandle(kv.second.hFile);
+            }
+        }
+        
+        LeaveCriticalSection(&g_dumpLock);
+        
         MH_Uninitialize();
         DeleteCriticalSection(&g_logLock);
         DeleteCriticalSection(&g_dumpLock);
