@@ -50,7 +50,8 @@ BOOL InjectDLL(DWORD processId, const char* dllPath) {
     }
 
     HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-    LPVOID pLoadLibrary = GetProcAddress(hKernel32, "LoadLibraryA");
+    LPVOID pLoadLibrary = reinterpret_cast<LPVOID>(
+        GetProcAddress(hKernel32, "LoadLibraryA"));
 
     HANDLE hThread = CreateRemoteThread(hProcess, NULL, 0, 
                                        (LPTHREAD_START_ROUTINE)pLoadLibrary, 
@@ -105,3 +106,4 @@ int main(int argc, char* argv[]) {
     system("pause");
     return 0;
 }
+
