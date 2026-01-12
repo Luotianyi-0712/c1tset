@@ -6,22 +6,46 @@
 #include <cstring>
 #include "MinHook.h"
 
-static const char* kDumpRoot = ".\\";
-static const char* kDumpDir = ".\\";
+static std::string g_dumpRoot;
+static std::string g_dumpDir;
 
 static CRITICAL_SECTION g_logLock;
 static volatile LONG g_dumpedAssembly = 0;
 
+static std::string GetModuleDir(HMODULE module) {
+    char path[MAX_PATH] = {};
+    const DWORD len = GetModuleFileNameA(module, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        return ".\\";
+    }
+    std::string full(path);
+    const size_t pos = full.find_last_of("\\/");
+    if (pos == std::string::npos) {
+        return ".\\";
+    }
+    return full.substr(0, pos + 1);
+}
+
 static void Log(const std::string& msg) {
     EnterCriticalSection(&g_logLock);
-    std::ofstream logFile(std::string(kDumpDir) + "decrypt_log.txt", std::ios::app);
+    const std::string dir = g_dumpDir.empty() ? ".\\" : g_dumpDir;
+    std::ofstream logFile(dir + "decrypt_log.txt", std::ios::app);
+    if (!logFile.is_open()) {
+        OutputDebugStringA(("Log open failed: " + dir + "decrypt_log.txt\n").c_str());
+        LeaveCriticalSection(&g_logLock);
+        return;
+    }
     logFile << msg << std::endl;
     LeaveCriticalSection(&g_logLock);
 }
 
 static void EnsureDumpDir() {
-    CreateDirectoryA(kDumpRoot, nullptr);
-    CreateDirectoryA(kDumpDir, nullptr);
+    if (!g_dumpRoot.empty()) {
+        CreateDirectoryA(g_dumpRoot.c_str(), nullptr);
+    }
+    if (!g_dumpDir.empty()) {
+        CreateDirectoryA(g_dumpDir.c_str(), nullptr);
+    }
 }
 
 static bool ContainsAscii(const unsigned char* data, size_t size, const char* needle) {
@@ -92,7 +116,8 @@ static void DumpAssemblyOnce(const char* tag, const unsigned char* data, size_t 
     if (InterlockedCompareExchange(&g_dumpedAssembly, 1, 0) != 0) {
         return;
     }
-    std::string path = std::string(kDumpDir) + "Assembly-CSharp.dll";
+    const std::string dir = g_dumpDir.empty() ? ".\\" : g_dumpDir;
+    std::string path = dir + "Assembly-CSharp.dll";
     if (WriteFileBytes(path, data, size)) {
         std::ostringstream oss;
         oss << "Dumped Assembly-CSharp.dll from " << tag << " (" << size << " bytes)";
@@ -154,6 +179,7 @@ static bool InstallHook(void* target, void* detour, void** original, const char*
 static DWORD WINAPI HookThread(LPVOID) {
     EnsureDumpDir();
     Log("DumpDecrypt injected");
+    Log("Log path: " + (g_dumpDir.empty() ? std::string(".\\decrypt_log.txt") : g_dumpDir + "decrypt_log.txt"));
 
     HMODULE unity = nullptr;
     for (int i = 0; i < 120; ++i) {
@@ -189,6 +215,8 @@ static DWORD WINAPI HookThread(LPVOID) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+        g_dumpRoot = GetModuleDir(hModule);
+        g_dumpDir = g_dumpRoot;
         InitializeCriticalSection(&g_logLock);
         EnsureDumpDir();
         if (MH_Initialize() != MH_OK) {
