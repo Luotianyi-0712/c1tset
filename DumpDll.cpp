@@ -66,7 +66,8 @@ void OnMonoLoad() {
         return;
     }
 
-    PVOID funcAddr = GetProcAddress(hMono, "mono_image_open_from_data_with_name");
+    PVOID funcAddr = reinterpret_cast<PVOID>(
+        GetProcAddress(hMono, "mono_image_open_from_data_with_name"));
     if (!funcAddr) {
         Log("Failed to get mono_image_open_from_data_with_name address");
         return;
@@ -77,7 +78,7 @@ void OnMonoLoad() {
     Log(buf);
 
     // 创建 Hook
-    if (MH_CreateHook(funcAddr, my_mono_image_open_from_data_with_name, 
+    if (MH_CreateHook(funcAddr, reinterpret_cast<LPVOID>(my_mono_image_open_from_data_with_name),
                       reinterpret_cast<LPVOID*>(&oriMonoImageOpen)) != MH_OK) {
         Log("MH_CreateHook failed");
         return;
@@ -112,13 +113,14 @@ HMODULE WINAPI MyLoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFla
 }
 
 BOOL HookLoadLibrary() {
-    PVOID LoadLibraryAddr = GetProcAddress(GetModuleHandleA("KernelBase.dll"), "LoadLibraryExW");
+    PVOID LoadLibraryAddr = reinterpret_cast<PVOID>(
+        GetProcAddress(GetModuleHandleA("KernelBase.dll"), "LoadLibraryExW"));
     if (!LoadLibraryAddr) {
         Log("Failed to get LoadLibraryExW address");
         return FALSE;
     }
 
-    if (MH_CreateHook(LoadLibraryAddr, MyLoadLibraryExW, 
+    if (MH_CreateHook(LoadLibraryAddr, reinterpret_cast<LPVOID>(MyLoadLibraryExW),
                       reinterpret_cast<LPVOID*>(&oriLoadLibraryExW)) != MH_OK) {
         Log("MH_CreateHook LoadLibraryExW failed");
         return FALSE;
@@ -163,3 +165,4 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     }
     return TRUE;
 }
+
