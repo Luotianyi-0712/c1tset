@@ -6,8 +6,8 @@
 #include <cstring>
 #include "MinHook.h"
 
-static const char* kDumpRoot = "D:\\browndust2_dump\\";
-static const char* kDumpDir = "D:\\browndust2_dump\\decrypt\\";
+static const char* kDumpRoot = ".\\";
+static const char* kDumpDir = ".\\";
 
 static CRITICAL_SECTION g_logLock;
 static volatile LONG g_dumpedAssembly = 0;
