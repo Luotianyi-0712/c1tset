@@ -5,7 +5,7 @@
 
 using namespace std;
 
-const string Dump_Path = "D:\\browndust2_dump\\";
+const string Dump_Path = ".\\";
 
 void Log(const string& msg) {
     ofstream logFile(Dump_Path + "log.txt", ios::app);
@@ -165,3 +165,4 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     }
     return TRUE;
 }
+
