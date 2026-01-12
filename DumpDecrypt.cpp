@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <set>
 #include "MinHook.h"
 
 static std::string g_dumpDir;
@@ -12,24 +13,18 @@ static CRITICAL_SECTION g_logLock;
 static CRITICAL_SECTION g_dumpLock;
 static volatile LONG g_callCount = 0;
 
-// 用a1作为流标识
-struct StreamInfo {
-    unsigned int id;
-    std::string path;
-    HANDLE hFile;
-    long long first_offset;
-    long long last_offset;
-    long long min_offset;
-    long long max_offset;
-    size_t total_bytes;
-    size_t chunk_count;
-    bool has_mz;
-    bool has_bsjb;
-    bool has_name;
-};
+// 全局dump - 所有数据写入同一个文件
+static std::string g_dumpPath;
+static HANDLE g_dumpFile = INVALID_HANDLE_VALUE;
+static std::set<long long> g_writtenOffsets;
+static long long g_maxOffset = 0;
+static size_t g_totalBytes = 0;
 
-static std::map<void*, StreamInfo> g_streams;  // key = a1
-static unsigned int g_streamIndex = 0;
+// 签名追踪
+static bool g_foundName = false;
+static bool g_foundBSJB = false;
+static long long g_nameOffset = -1;
+static long long g_bsjbOffset = -1;
 
 static std::string GetModuleDir(HMODULE module) {
     char path[MAX_PATH] = {};
@@ -85,10 +80,9 @@ static bool __fastcall HookSub69FE00(void* a1, long long* a2, long long a3, void
     const size_t size = static_cast<size_t>(readSize);
     const long long offset = (a2 ? *a2 : -1);
     
-    if (offset < 0) return ok;
-    
-    // 用a1作为流标识！
-    void* streamKey = a1;
+    if (offset < 0 || offset > 200 * 1024 * 1024) {  // 忽略超过200MB的offset
+        return ok;
+    }
     
     const bool hitName = ContainsAscii(buf, size, "Assembly-CSharp");
     const bool hitBSJB = ContainsAscii(buf, size, "BSJB");
@@ -98,70 +92,53 @@ static bool __fastcall HookSub69FE00(void* a1, long long* a2, long long a3, void
     
     EnterCriticalSection(&g_dumpLock);
     
-    // 查找或创建流
-    auto it = g_streams.find(streamKey);
-    if (it == g_streams.end()) {
-        StreamInfo info = {};
-        info.id = ++g_streamIndex;
-        info.path = g_dumpDir + "stream_" + std::to_string(info.id) + ".bin";
-        info.hFile = CreateFileA(info.path.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
-                                 nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        info.first_offset = offset;
-        info.last_offset = -1;
-        info.min_offset = offset;
-        info.max_offset = offset;
-        info.total_bytes = 0;
-        info.chunk_count = 0;
-        info.has_mz = false;
-        info.has_bsjb = false;
-        info.has_name = false;
-        
-        it = g_streams.emplace(streamKey, info).first;
-        
-        std::ostringstream oss;
-        oss << "NEW STREAM #" << info.id << " a1=" << streamKey << " first_offset=" << offset;
-        Log(oss.str());
+    // 记录签名位置
+    if (hitName && !g_foundName) {
+        g_foundName = true;
+        g_nameOffset = offset;
+        Log("*** Found Assembly-CSharp at offset " + std::to_string(offset));
+    }
+    if (hitBSJB && !g_foundBSJB) {
+        g_foundBSJB = true;
+        g_bsjbOffset = offset;
+        Log("*** Found BSJB at offset " + std::to_string(offset));
     }
     
-    StreamInfo& stream = it->second;
-    
-    // 更新签名
-    if (hitMZ) stream.has_mz = true;
-    if (hitBSJB) stream.has_bsjb = true;
-    if (hitName) stream.has_name = true;
-    
-    // 更新offset范围
-    if (offset < stream.min_offset) stream.min_offset = offset;
-    if (offset > stream.max_offset) stream.max_offset = offset;
-    
-    // 写入文件（使用相对于min_offset的位置）
-    if (stream.hFile != INVALID_HANDLE_VALUE) {
-        long long write_offset = offset - stream.min_offset;
-        
-        LARGE_INTEGER li;
-        li.QuadPart = write_offset;
-        SetFilePointerEx(stream.hFile, li, nullptr, FILE_BEGIN);
-        
-        DWORD written = 0;
-        WriteFile(stream.hFile, buf, static_cast<DWORD>(size), &written, nullptr);
-        
-        stream.total_bytes += written;
-        stream.chunk_count++;
+    // 只有发现签名后才开始dump
+    if (g_foundName || g_foundBSJB || hitName || hitBSJB) {
+        // 检查是否已写入此offset
+        if (g_writtenOffsets.find(offset) == g_writtenOffsets.end()) {
+            if (g_dumpFile != INVALID_HANDLE_VALUE) {
+                LARGE_INTEGER li;
+                li.QuadPart = offset;
+                SetFilePointerEx(g_dumpFile, li, nullptr, FILE_BEGIN);
+                
+                DWORD written = 0;
+                WriteFile(g_dumpFile, buf, static_cast<DWORD>(size), &written, nullptr);
+                
+                g_writtenOffsets.insert(offset);
+                g_totalBytes += written;
+                
+                if (offset + static_cast<long long>(size) > g_maxOffset) {
+                    g_maxOffset = offset + static_cast<long long>(size);
+                }
+            }
+        }
     }
-    
-    stream.last_offset = offset;
     
     // 日志
-    if (callIndex <= 50 || hitName || hitBSJB || hitMZ || 
-        (stream.has_name && stream.chunk_count % 1000 == 0)) {
+    bool shouldLog = (callIndex <= 50) || hitName || hitBSJB || hitMZ;
+    if (g_foundName && callIndex % 500 == 0) shouldLog = true;  // 每500次记录一次
+    
+    if (shouldLog) {
         std::ostringstream oss;
         oss << "#" << callIndex
-            << " stream#" << stream.id
+            << " a1=" << a1
             << " off=" << offset
             << " sz=" << size
-            << " chunks=" << stream.chunk_count
-            << " total=" << stream.total_bytes
-            << " range=[" << stream.min_offset << "," << stream.max_offset << "]";
+            << " total=" << g_totalBytes
+            << " max=" << g_maxOffset
+            << " chunks=" << g_writtenOffsets.size();
         if (hitMZ) oss << " [MZ]";
         if (hitBSJB) oss << " [BSJB]";
         if (hitName) oss << " [NAME]";
@@ -171,66 +148,6 @@ static bool __fastcall HookSub69FE00(void* a1, long long* a2, long long a3, void
     LeaveCriticalSection(&g_dumpLock);
     
     return ok;
-}
-
-static void PrintFinalStatus() {
-    Log("\n=== FINAL STREAM STATUS ===");
-    Log("Looking for: ~62.5MB file with Assembly-CSharp + BSJB");
-    Log("");
-    
-    StreamInfo* bestMatch = nullptr;
-    int bestScore = 0;
-    
-    for (auto& kv : g_streams) {
-        StreamInfo& s = kv.second;
-        
-        // 计算文件大小（基于offset范围）
-        long long fileSize = s.max_offset - s.min_offset + 7168;  // 估算
-        
-        // 评分
-        int score = 0;
-        if (s.has_name) score += 100;
-        if (s.has_bsjb) score += 50;
-        if (s.has_mz) score += 10;
-        if (fileSize >= 50000000 && fileSize <= 80000000) score += 200;  // 大小匹配
-        
-        std::ostringstream oss;
-        oss << "Stream #" << s.id
-            << " | score=" << score
-            << " | size~" << (fileSize / 1024 / 1024) << "MB"
-            << " | chunks=" << s.chunk_count
-            << " | MZ=" << s.has_mz
-            << " | BSJB=" << s.has_bsjb
-            << " | NAME=" << s.has_name
-            << " | range=[" << s.min_offset << "," << s.max_offset << "]";
-        Log(oss.str());
-        
-        if (score > bestScore) {
-            bestScore = score;
-            bestMatch = &s;
-        }
-    }
-    
-    if (bestMatch && bestScore >= 150) {
-        Log("");
-        Log("*** BEST MATCH: Stream #" + std::to_string(bestMatch->id) + " ***");
-        
-        // 关闭并重命名
-        if (bestMatch->hFile != INVALID_HANDLE_VALUE) {
-            FlushFileBuffers(bestMatch->hFile);
-            CloseHandle(bestMatch->hFile);
-            bestMatch->hFile = INVALID_HANDLE_VALUE;
-        }
-        
-        std::string newName = g_dumpDir + "Assembly-CSharp_DUMPED.dll";
-        DeleteFileA(newName.c_str());
-        if (MoveFileA(bestMatch->path.c_str(), newName.c_str())) {
-            Log("Renamed to: " + newName);
-        }
-    } else {
-        Log("");
-        Log("No confident match found. Check streams manually.");
-    }
 }
 
 static bool InstallHook(void* target, void* detour, void** original, const char* name) {
@@ -249,7 +166,20 @@ static bool InstallHook(void* target, void* detour, void** original, const char*
 static DWORD WINAPI HookThread(LPVOID) {
     EnsureDumpDir();
     
-    Log("=== DumpDecrypt v6 - Using a1 as stream key ===");
+    g_dumpPath = g_dumpDir + "Assembly-CSharp_DUMP.dll";
+    DeleteFileA(g_dumpPath.c_str());
+    
+    g_dumpFile = CreateFileA(g_dumpPath.c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                             nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    
+    if (g_dumpFile == INVALID_HANDLE_VALUE) {
+        Log("Failed to create dump file!");
+        return 0;
+    }
+    
+    Log("=== DumpDecrypt v7 - Global Accumulation ===");
+    Log("Output: " + g_dumpPath);
+    Log("Target: ~62.5MB Assembly-CSharp.dll");
     
     HMODULE unity = nullptr;
     for (int i = 0; i < 120; ++i) {
@@ -274,26 +204,44 @@ static DWORD WINAPI HookThread(LPVOID) {
     InstallHook(addr69fe00, reinterpret_cast<void*>(&HookSub69FE00),
                 reinterpret_cast<void**>(&g_origSub69FE00), "sub_18069FE00");
     
-    // 定期报告
+    // 监控进度
+    size_t lastTotal = 0;
+    int stableCount = 0;
+    
     while (true) {
-        Sleep(15000);
+        Sleep(5000);
+        
         EnterCriticalSection(&g_dumpLock);
         
+        double sizeMB = g_totalBytes / (1024.0 * 1024.0);
+        double maxMB = g_maxOffset / (1024.0 * 1024.0);
+        double coverage = (g_maxOffset > 0) ? (100.0 * g_totalBytes / g_maxOffset) : 0;
+        
         std::ostringstream status;
-        status << "STATUS: " << g_streams.size() << " streams, " << g_callCount << " calls";
+        status << "STATUS: "
+               << sizeMB << "MB written, "
+               << maxMB << "MB max, "
+               << coverage << "% coverage, "
+               << g_writtenOffsets.size() << " chunks, "
+               << "NAME=" << g_foundName << " BSJB=" << g_foundBSJB;
         Log(status.str());
         
-        for (auto& kv : g_streams) {
-            StreamInfo& s = kv.second;
-            if (s.has_name || s.has_bsjb || s.total_bytes > 10000000) {
-                std::ostringstream oss;
-                oss << "  #" << s.id << ": " << (s.total_bytes/1024/1024) << "MB"
-                    << " chunks=" << s.chunk_count
-                    << " NAME=" << s.has_name
-                    << " BSJB=" << s.has_bsjb;
-                Log(oss.str());
+        // 检查是否完成
+        if (g_totalBytes == lastTotal && g_totalBytes > 0) {
+            stableCount++;
+            if (stableCount >= 6) {  // 30秒无新数据
+                Log("=== DUMP APPEARS COMPLETE ===");
+                
+                if (g_totalBytes >= 50000000 && g_totalBytes <= 80000000) {
+                    Log("*** Size matches Assembly-CSharp.dll! ***");
+                }
+                
+                stableCount = 0;
             }
+        } else {
+            stableCount = 0;
         }
+        lastTotal = g_totalBytes;
         
         LeaveCriticalSection(&g_dumpLock);
     }
@@ -306,7 +254,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(hModule);
         g_dumpDir = GetModuleDir(hModule);
         g_callCount = 0;
-        g_streamIndex = 0;
+        g_totalBytes = 0;
+        g_maxOffset = 0;
+        g_foundName = false;
+        g_foundBSJB = false;
+        g_nameOffset = -1;
+        g_bsjbOffset = -1;
         InitializeCriticalSection(&g_logLock);
         InitializeCriticalSection(&g_dumpLock);
         EnsureDumpDir();
@@ -322,15 +275,21 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     } else if (reason == DLL_PROCESS_DETACH) {
         EnterCriticalSection(&g_dumpLock);
         
-        PrintFinalStatus();
-        
-        // 关闭所有文件
-        for (auto& kv : g_streams) {
-            if (kv.second.hFile != INVALID_HANDLE_VALUE) {
-                FlushFileBuffers(kv.second.hFile);
-                CloseHandle(kv.second.hFile);
-            }
+        if (g_dumpFile != INVALID_HANDLE_VALUE) {
+            FlushFileBuffers(g_dumpFile);
+            CloseHandle(g_dumpFile);
+            g_dumpFile = INVALID_HANDLE_VALUE;
         }
+        
+        std::ostringstream final_log;
+        final_log << "\n=== FINAL RESULT ===" << std::endl
+                  << "Total: " << g_totalBytes << " bytes (" << (g_totalBytes/1024/1024) << " MB)" << std::endl
+                  << "Max offset: " << g_maxOffset << std::endl
+                  << "Chunks: " << g_writtenOffsets.size() << std::endl
+                  << "NAME found: " << g_foundName << " at " << g_nameOffset << std::endl
+                  << "BSJB found: " << g_foundBSJB << " at " << g_bsjbOffset << std::endl
+                  << "Output: " << g_dumpPath;
+        Log(final_log.str());
         
         LeaveCriticalSection(&g_dumpLock);
         
