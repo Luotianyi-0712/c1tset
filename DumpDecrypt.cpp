@@ -13,6 +13,7 @@ static CRITICAL_SECTION g_logLock;
 static CRITICAL_SECTION g_dumpLock;
 static volatile LONG g_dumpedAssembly = 0;
 static void* g_activeKey = nullptr;
+static bool g_confirmed = false;
 static volatile LONG g_callCount = 0;
 
 static std::string GetModuleDir(HMODULE module) {
@@ -153,6 +154,9 @@ static void StopDump(const char* reason) {
     std::ostringstream oss;
     oss << "Stop dump: " << reason;
     Log(oss.str());
+    g_activeKey = nullptr;
+    g_confirmed = false;
+    InterlockedExchange(&g_dumpedAssembly, 0);
 }
 
 using FnSub69FE00 = bool(*)(void* a1, long long* a2, long long a3, void* a4, unsigned long long* a5, long long a6);
@@ -188,7 +192,9 @@ static bool __fastcall HookSub69FE00(void* a1, long long* a2, long long a3, void
         }
 
         EnterCriticalSection(&g_dumpLock);
-        if (!g_activeKey) {
+        if (!g_activeKey && offset == 0) {
+            StartDump(key, offset, static_cast<size_t>(readSize), "offset0");
+        } else if (!g_activeKey) {
             if (hitName) {
                 StartDump(key, offset, static_cast<size_t>(readSize), "name");
             } else if (hitBSJB) {
@@ -203,12 +209,19 @@ static bool __fastcall HookSub69FE00(void* a1, long long* a2, long long a3, void
             std::ostringstream oss;
             oss << "Chunk offset=" << offset << " size=" << readSize;
             Log(oss.str());
+
+            if (!g_confirmed && (hitName || hitBSJB || hitMZ)) {
+                g_confirmed = true;
+                std::ostringstream confirm;
+                confirm << "Confirmed stream by signature (name=" << hitName
+                        << " bsjb=" << hitBSJB << " mz=" << hitMZ << ")";
+                Log(confirm.str());
+            }
         }
         LeaveCriticalSection(&g_dumpLock);
     } else if (!ok || (a5 && *a5 == 0)) {
         EnterCriticalSection(&g_dumpLock);
         if (g_activeKey == a2) {
-            g_activeKey = nullptr;
             StopDump("eof");
         }
         LeaveCriticalSection(&g_dumpLock);
@@ -296,6 +309,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
         g_dumpDir = g_dumpRoot;
         g_dumpedAssembly = 0;
         g_activeKey = nullptr;
+        g_confirmed = false;
         g_callCount = 0;
         InitializeCriticalSection(&g_logLock);
         InitializeCriticalSection(&g_dumpLock);
