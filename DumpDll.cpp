@@ -5,12 +5,30 @@
 
 using namespace std;
 
-const string Dump_Path = ".\\";
+static string g_dumpPath;
+
+static string GetModuleDir(HMODULE module) {
+    char path[MAX_PATH] = {};
+    const DWORD len = GetModuleFileNameA(module, path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) {
+        return ".\\";
+    }
+    string full(path);
+    const size_t pos = full.find_last_of("\\/");
+    if (pos == string::npos) {
+        return ".\\";
+    }
+    return full.substr(0, pos + 1);
+}
 
 void Log(const string& msg) {
-    ofstream logFile(Dump_Path + "log.txt", ios::app);
+    const string path = g_dumpPath.empty() ? ".\\" : g_dumpPath;
+    ofstream logFile(path + "log.txt", ios::app);
+    if (!logFile.is_open()) {
+        OutputDebugStringA(("Log open failed: " + path + "log.txt\n").c_str());
+        return;
+    }
     logFile << msg << endl;
-    logFile.close();
 }
 
 // Hook mono_image_open_from_data_with_name
@@ -31,7 +49,7 @@ void* WINAPI my_mono_image_open_from_data_with_name(
 
         // Dump Assembly-CSharp.dll
         if (str_name.find("Assembly-CSharp.dll") != string::npos) {
-            string path = Dump_Path + "Assembly-CSharp.dll";
+            const string path = (g_dumpPath.empty() ? ".\\" : g_dumpPath) + "Assembly-CSharp.dll";
             HANDLE hFile = CreateFileA(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFile != INVALID_HANDLE_VALUE) {
                 DWORD written;
@@ -42,7 +60,7 @@ void* WINAPI my_mono_image_open_from_data_with_name(
         }
         // 也可以 dump 其他 DLL
         else if (str_name.find("Assembly-CSharp-firstpass.dll") != string::npos) {
-            string path = Dump_Path + "Assembly-CSharp-firstpass.dll";
+            const string path = (g_dumpPath.empty() ? ".\\" : g_dumpPath) + "Assembly-CSharp-firstpass.dll";
             HANDLE hFile = CreateFileA(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
             if (hFile != INVALID_HANDLE_VALUE) {
                 DWORD written;
@@ -139,18 +157,18 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
         DisableThreadLibraryCalls(hModule);
-        
-        // 创建输出目录
-        CreateDirectoryA(Dump_Path.c_str(), NULL);
-        
+
+        g_dumpPath = GetModuleDir(hModule);
+
+        Log("DLL Injected!");
+        Log("Log path: " + g_dumpPath + "log.txt");
+
         // 初始化 MinHook
         if (MH_Initialize() != MH_OK) {
             Log("MH_Initialize failed");
             return FALSE;
         }
-        
-        Log("DLL Injected!");
-        
+
         // Hook LoadLibrary
         if (!HookLoadLibrary()) {
             Log("HookLoadLibrary failed");
@@ -165,4 +183,3 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     }
     return TRUE;
 }
-
