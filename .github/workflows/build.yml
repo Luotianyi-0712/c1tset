@@ -16,26 +16,14 @@ jobs:
           update: true
           install: >-
             mingw-w64-x86_64-toolchain
-            mingw-w64-x86_64-cmake
             mingw-w64-x86_64-make
             git
 
-      - name: Prepare MinHook
+      - name: Fetch MinHook
         shell: msys2 {0}
         run: |
-          rm -rf deps minhook
-          git clone --depth 1 --branch v1.3.3 https://github.com/TsudaKageyu/minhook.git deps/minhook-src
-          cmake -S deps/minhook-src -B deps/minhook-src/build -G "MinGW Makefiles" -DCMAKE_BUILD_TYPE=Release
-          cmake --build deps/minhook-src/build --config Release
-          mkdir -p minhook/include minhook/lib
-          cp -r deps/minhook-src/include/* minhook/include/
-          mkdir -p minhook/lib
-          lib_path=$(find deps/minhook-src/build -name "libMinHook.a" | head -n 1)
-          if [ -z "$lib_path" ]; then
-            echo "MinHook lib not found"
-            exit 1
-          fi
-          cp "$lib_path" minhook/lib/libminhook.x64.a
+          rm -rf minhook
+          git clone --depth 1 --branch v1.3.3 https://github.com/TsudaKageyu/minhook.git minhook
 
       - name: Build
         shell: msys2 {0}
@@ -48,4 +36,3 @@ jobs:
             DumpDll.dll
             DumpDecrypt.dll
             Injector.exe
-
