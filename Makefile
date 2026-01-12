@@ -6,6 +6,7 @@ CC = x86_64-w64-mingw32-gcc
 CXXFLAGS = -std=c++11 -O2 -Wall
 CFLAGS = -O2 -Wall
 LDFLAGS = -static-libgcc -static-libstdc++ -s
+EXE_LDFLAGS = $(LDFLAGS) -Wl,-Bstatic -lwinpthread -Wl,-Bdynamic
 
 # MinHook paths
 MINHOOK_DIR = ./minhook
@@ -71,7 +72,7 @@ $(EXE_TARGET): $(EXE_SRC)
 	@echo "Compiling $(EXE_TARGET)..."
 	$(CXX) -o $@ $< \
 		$(CXXFLAGS) \
-		$(LDFLAGS)
+		$(EXE_LDFLAGS)
 	@echo "$(EXE_TARGET) compiled"
 
 clean:
